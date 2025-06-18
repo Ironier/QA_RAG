@@ -15,8 +15,7 @@ if not pm.is_installed("pymilvus"):
     pm.install("pymilvus")
 
 import configparser
-from pymilvus import MilvusClient
-
+from pymilvus import MilvusClient, CollectionSchema, FieldSchema, DataType
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
 
@@ -26,13 +25,20 @@ config.read("config.ini", "utf-8")
 class MilvusVectorDBStorage(BaseVectorStorage):
     @staticmethod
     def create_collection_if_not_exist(
-        client: MilvusClient, collection_name: str, **kwargs
+        client: MilvusClient, collection_name: str, dimension: int, **kwargs
     ):
-        if client.has_collection(collection_name):
+        if collection_name in client.list_collections():
             return
-        client.create_collection(
-            collection_name, max_length=64, id_type="string", **kwargs
+        schema = CollectionSchema(
+            fields=[
+                FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, auto_id=False, max_length=128),
+                FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
+                FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
+            ],
+            description="Vector store for RAG"
         )
+
+        client.create_collection(collection_name=collection_name, schema=schema)
 
     def __post_init__(self):
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
@@ -46,13 +52,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         self._client = MilvusClient(
             uri=os.environ.get(
                 "MILVUS_URI",
-                config.get(
-                    "milvus",
-                    "uri",
-                    fallback=os.path.join(
-                        self.global_config["working_dir"], "milvus_lite.db"
-                    ),
-                ),
+                config.get("milvus", "uri", fallback=None)
             ),
             user=os.environ.get(
                 "MILVUS_USER", config.get("milvus", "user", fallback=None)
@@ -98,7 +98,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         embeddings = np.concatenate(embeddings_list)
         for i, d in enumerate(list_data):
             d["vector"] = embeddings[i]
-        results = self._client.upsert(collection_name=self.namespace, data=list_data)
+        results = self._client.insert(collection_name=self.namespace, data=list_data)
         return results
 
     async def query(
@@ -112,7 +112,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             output_fields=list(self.meta_fields),
             search_params={
                 "metric_type": "COSINE",
-                "params": {"radius": self.cosine_better_than_threshold},
+                "params": {"ef": 128},
             },
         )
         print(results)

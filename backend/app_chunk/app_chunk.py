@@ -7,142 +7,50 @@ import json
 import docx
 import markdownify
 from docx import Document
-from docx.text.paragraph import Paragraph
+
 import spacy
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from pymongo import MongoClient
 from flask_cors import CORS
 import datetime
-import asyncio
 import threading
 import numpy as np
 
-import configparser
-
-from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.utils import setup_logger, EmbeddingFunc
 
 import nest_asyncio
 nest_asyncio.apply()
 # 初始化日志
 setup_logger("lightrag", level="INFO")
+
+from app_rag.rag_service import initialize_rag_sync, insert_chunks_into_rag, run_async_in_thread, get_rag_instance
+
+
+# 配置RAG
+# os.environ["HF_DATASETS_CACHE"] = "/path/to/cache"  # 修改为你的缓存路径
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 mongo_client = MongoClient('mongodb://172.27.177.119:27017/')
 
+import configparser
 g_config = configparser.ConfigParser()
-g_config.read("../config.ini")
+g_config.read("config.ini")
 
 minio_client = Minio(
-    g_config["minio"]["uri"],
-    access_key=g_config["minio"]["access_key"],
-    secret_key=g_config["minio"]["secret_key"],
+    g_config.get("minio", "uri"),
+    access_key=g_config.get("minio", "access_key"),
+    secret_key=g_config.get("minio", "secret_key"),
     secure=False
 )
-
-os.environ['NEO4J_URI'] = g_config['neo4j']['uri']
-os.environ['NEO4J_USERNAME'] = g_config['neo4j']['username']
-os.environ['NEO4J_PASSWORD'] = g_config['neo4j']['password']
-
-# 全局RAG实例和锁
-global_rag = None
-rag_lock = threading.Lock()
 
 app = Flask(__name__)
 CORS(app)
 
-# 异步初始化RAG的函数
-async def initialize_rag_async():
-    rag = LightRAG(
-        working_dir="./output",
-        embedding_func=EmbeddingFunc(
-            embedding_dim=1024,
-            max_token_size=8192,
-            func=embedding_func,
-        ),
-        llm_model_func=llm_model_func,
-        graph_storage="Neo4JStorage",
-        vector_storage="FaissVectorDBStorage",
-        vector_db_storage_cls_kwargs={
-            "cosine_better_than_threshold": 0.6  # Your desired threshold
-        },
-        addon_params={
-            "example_number": 5,
-            "language": "Simplfied Chinese",
-            "entity_types": ["organization", "person", "geo", "event", "legal term", "category"],
-        },
-    )
-    await rag.initialize_storages()
-    await initialize_pipeline_status()
-    return rag
-
-# 同步初始化RAG的包装函数
-def initialize_rag_sync():
-    global global_rag
-
-    async def init_wrapper():
-        return await initialize_rag_async()
-
-    def run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(init_wrapper())
-
-    if global_rag is None:
-        with rag_lock:
-            if global_rag is None:
-                global_rag = run()
-    return global_rag
-
-def run_async_in_thread(async_func, *args, **kwargs):
-    result_container = {}
-
-    def wrapper():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result_container["result"] = loop.run_until_complete(async_func(*args, **kwargs))
-
-    thread = threading.Thread(target=wrapper)
-    thread.start()
-    thread.join()
-    return result_container.get("result", None)
-
-
-# RAG的LLM模型函数
-async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str:
-    return await openai_complete_if_cache(
-        g_config['chat_model']['name'],
-        prompt,
-        system_prompt=system_prompt,
-        history_messages=history_messages,
-        api_key=g_config['chat_model']['api_key'],
-        base_url=g_config['chat_model']['uri'],
-        **kwargs,
-    )
-
-# RAG的嵌入函数
-async def embedding_func(texts: list[str]) -> np.ndarray:
-    return await openai_embed(
-        texts,
-        model=g_config['embedding_model']['name'],
-        api_key=g_config['embedding_model']['api_key'],
-        base_url=g_config['embedding_model']['uri'],
-    )
-
-# 将分块插入RAG
-async def insert_chunks_into_rag(rag, chunks):
-    try:
-        for chunk in chunks:
-            rag.insert(chunk["content"])
-        print(f"成功插入 {len(chunks)} 个分块到RAG")
-    except Exception as e:
-        print(f"插入分块到RAG失败: {str(e)}")
-        raise
 
 def get_minio_doc(filename):
     try:
-        response = minio_client.get_object(g_config["minio"]["bucket"], filename)
+        response = minio_client.get_object('doc', filename)
         docx_bytes = response.read()
         response.close()
         return Document(BytesIO(docx_bytes))
@@ -367,11 +275,7 @@ def run_script():
 
         # 将分块加入RAG
         try:
-            with rag_lock:
-                if global_rag is None:
-                    initialize_rag_sync()
-                # 同步插入分块到RAG
-                run_async_in_thread(insert_chunks_into_rag, global_rag, grouped_result)
+            run_async_in_thread(insert_chunks_into_rag, get_rag_instance(), grouped_result)
 
         except Exception as e:
             app.logger.error(f"插入RAG失败: {str(e)}")
